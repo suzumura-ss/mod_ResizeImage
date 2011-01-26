@@ -69,6 +69,7 @@ static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_
 {
   request_rec* rec =f->r;
   const char* content_type, *target_type = "JPEG";
+  size_t quality = 95;
   const char* image_url, *resize_param;
   Magick::Blob  blob;
 
@@ -114,6 +115,7 @@ static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_
     Magick::Image image(image_url);
     if(resize_param) image.zoom(resize_param);
     image.magick(target_type);
+    image.quality(quality);
     image.write(&blob);
   }
   catch(Magick::Exception& err) {
