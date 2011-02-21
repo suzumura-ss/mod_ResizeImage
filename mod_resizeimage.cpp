@@ -112,7 +112,8 @@ static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_
   // Open image and resize.
   AP_LOG_INFO(rec, "URL: %s, %s => %s", image_url, content_type, resize_param);
   try {
-    Magick::Image image(image_url);
+    Magick::Image image;
+    image.read(resize_param, image_url);
     if(resize_param) image.zoom(resize_param);
     image.magick(target_type);
     image.quality(quality);
