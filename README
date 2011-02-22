@@ -4,7 +4,8 @@ Description:
   This module adds x-resizeimage header support to Apache/2.x.
 
 Require modules:
-  ImageMagick-c++devel
+  ImageMagick-c++-devel
+  libmemcached-devel
 
 To build in Linux (CentOS):
   $ make

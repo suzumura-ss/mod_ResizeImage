@@ -2,7 +2,7 @@ CXX=g++
 INSTALL=install
 #CFLAGS=-Wall -O3
 CFLAGS=-Wall -g
-CFLAGS+=`pkg-config --cflags --libs apr-1 apr-util-1 ImageMagick++`
+CFLAGS+=`pkg-config --cflags --libs apr-1 apr-util-1 ImageMagick++ libmemcached`
 
 TARGET=mod_resizeimage.so
 TARGETDIR=/usr/lib/httpd/modules/

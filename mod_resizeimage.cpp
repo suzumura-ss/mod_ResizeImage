@@ -27,6 +27,7 @@ extern "C" {
   #include <apr_strings.h>
 }
 #include <Magick++.h>
+#include <libmemcached/memcached.h>
 
 #define AP_LOG_VERBOSE(rec, fmt, ...) //ap_log_rerror(APLOG_MARK, APLOG_DEBUG,  0, rec, fmt, ##__VA_ARGS__)
 #define AP_LOG_DEBUG(rec, fmt, ...) ap_log_rerror(APLOG_MARK, APLOG_DEBUG,  0, rec, fmt, ##__VA_ARGS__)
@@ -38,10 +39,14 @@ extern "C" {
 
 static const char X_RESIZE[] = RESIZE;
 static const char X_RESIZE_PARAM[] = RESIZE "-Param";
+static const char X_RESIZE_HASH[]  = RESIZE "-Hash";
 extern "C" module AP_MODULE_DECLARE_DATA resizeimage_module;
 
 struct resize_conf {
-  int   enabled;
+  int       enabled;
+  int       expire;
+  int       jpeg_quality;
+  memcached_st* memc;
 };
 
 //
@@ -68,10 +73,13 @@ static void unset_header(request_rec* rec, const char* key)
 static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_bb)
 {
   request_rec* rec =f->r;
+  resize_conf* conf = (resize_conf*)ap_get_module_config(rec->per_dir_config, &resizeimage_module);
   const char* content_type, *target_type = "JPEG";
-  size_t quality = 95;
-  const char* image_url, *resize_param;
-  Magick::Blob  blob;
+  const char* image_url, *resize_param, *image_hash=NULL;
+  Magick::Blob blob;
+  char* vlob = NULL;
+  size_t vlob_length = 0;
+  int cache_hit = FALSE;
 
   AP_LOG_VERBOSE(rec, "Incoming %s.", __FUNCTION__);
 
@@ -109,21 +117,54 @@ static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_
   }
   if(resize_param[0]=='\0') resize_param = NULL;
 
+  // Image hash
+  image_hash = get_and_unset_header(rec->headers_out, X_RESIZE_HASH);
+  if(image_hash==NULL || image_hash[0]=='\0') {
+    image_hash = get_and_unset_header(rec->err_headers_out, X_RESIZE_HASH);
+  }
+ 
   // Open image and resize.
-  AP_LOG_INFO(rec, "URL: %s, %s => %s", image_url, content_type, resize_param);
+  AP_LOG_INFO(rec, "URL: %s, %s => %s (%s)", image_url, content_type, resize_param, image_hash);
+
+  if(image_hash) {
+    // Try memcached...
+    image_hash = apr_psprintf(rec->pool, "%s:%s:%s", image_hash, target_type, resize_param);
+    memcached_return r;
+    uint32_t flags;
+    vlob = memcached_get(conf->memc, image_hash, strlen(image_hash), &vlob_length, &flags, &r);
+    if(r==MEMCACHED_SUCCESS) {
+      AP_LOG_DEBUG(rec, "Restored from memcached: %s, len=%d", image_hash, vlob_length);
+      cache_hit = TRUE;
+      goto WRITE_DATA;
+    }
+  }
+
+  // Reszize
   try {
     Magick::Image image;
-    image.read(resize_param, image_url);
+
+    image.read(image_url);
     if(resize_param) image.zoom(resize_param);
     image.magick(target_type);
-    image.quality(quality);
+    image.quality(conf->jpeg_quality);
     image.write(&blob);
+    vlob = (char*)blob.data();
+    vlob_length = blob.length();
   }
   catch(Magick::Exception& err) {
     AP_LOG_ERR(rec, __FILE__ ": Magick failed: %s", err.what());
     goto PASS_THRU;
   }
 
+  if(image_hash) {
+    // Store to memcached...
+    memcached_return r = memcached_set(conf->memc, image_hash, strlen(image_hash), vlob, vlob_length, conf->expire, 0);
+    if(r==MEMCACHED_SUCCESS) {
+      AP_LOG_DEBUG(rec, "Stored to memcached: %s, len=%d", image_hash, vlob_length);
+    }
+  }
+
+WRITE_DATA:
   AP_LOG_VERBOSE(rec, "-- Creating resize buckets.");
 
   // Drop all content and headers related.
@@ -140,19 +181,19 @@ static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_
 
   // Start resize bucket.
   {
-    apr_off_t remain = blob.length();
-    apr_off_t offset = 0;
+    apr_off_t remain = vlob_length, offset = 0;
     while(remain>0) {
       apr_off_t bs = (remain<AP_MAX_SENDFILE)? remain: AP_MAX_SENDFILE;
       char* heap = (char*)malloc(bs);
-      memcpy(heap, ((char*)blob.data())+offset, bs);
+      memcpy(heap, vlob+offset, bs);
       apr_bucket* b = apr_bucket_heap_create(heap, bs, free, in_bb-> bucket_alloc);
       APR_BRIGADE_INSERT_TAIL(in_bb, b);
       remain -= bs;
       offset += bs;
     }
     APR_BRIGADE_INSERT_TAIL(in_bb, apr_bucket_eos_create(in_bb->bucket_alloc));
-    ap_set_content_length(rec, blob.length());
+    ap_set_content_length(rec, vlob_length);
+    if(cache_hit) free(vlob);
   }
   AP_LOG_VERBOSE(rec, "-- Create done.");
  
@@ -179,12 +220,38 @@ static void* config_create(apr_pool_t* p, char* path)
 {
   resize_conf* conf = (resize_conf*)apr_palloc(p, sizeof(resize_conf));
   conf->enabled = FALSE;
+  conf->expire = 600;
+  conf->memc = memcached_create(NULL);
 
   return conf;
 }
 
+static const char* append_server(cmd_parms* parms, void* _conf, const char* w1, const char* w2)
+{
+  memcached_return r;
+  resize_conf* conf = (resize_conf*)_conf;
+  memcached_server_st* servers;
+  int port = atoi(w2);
+  if(port<=0 || port>65535) return "Bad port number.";
+
+  servers = memcached_server_list_append(NULL, w1, port, &r);
+  if(r!=MEMCACHED_SUCCESS) return "memcached_server_list_append() failed.";
+
+  r = memcached_server_push(conf->memc, servers);
+  if(r!=MEMCACHED_SUCCESS) {
+    memcached_server_list_free(servers);
+    return "memcached_server_push() failed.";
+  }
+  memcached_server_list_free(servers);
+
+  return NULL;
+}
+
 static const command_rec config_cmds[] = {
   AP_INIT_FLAG(X_RESIZE, (cmd_func)ap_set_flag_slot, (void*)APR_OFFSETOF(resize_conf, enabled), OR_OPTIONS, "{On|Off}"),
+  AP_INIT_TAKE2(RESIZE "-cache",  (cmd_func)append_server, NULL, OR_OPTIONS, "server, port"),
+  AP_INIT_TAKE1(RESIZE "-expire", (cmd_func)ap_set_int_slot, (void*)APR_OFFSETOF(resize_conf, expire), OR_OPTIONS, "expire(sec)"),
+  AP_INIT_TAKE1(RESIZE "-quality", (cmd_func)ap_set_int_slot, (void*)APR_OFFSETOF(resize_conf, jpeg_quality), OR_OPTIONS, "JPEG quality(~100)"),
   { NULL },
 };
 
