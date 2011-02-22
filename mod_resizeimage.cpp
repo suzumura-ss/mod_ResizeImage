@@ -136,6 +136,8 @@ static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_
       AP_LOG_DEBUG(rec, "Restored from memcached: %s, len=%d", image_hash, vlob_length);
       cache_hit = TRUE;
       goto WRITE_DATA;
+    } else {
+      AP_LOG_DEBUG(rec, "Can't restore from memcached: %s - %s(%d)", image_hash, memcached_strerror(conf->memc, r), r);
     }
   }
 
@@ -160,7 +162,9 @@ static apr_status_t resize_output_filter(ap_filter_t* f, apr_bucket_brigade* in_
     // Store to memcached...
     memcached_return r = memcached_set(conf->memc, image_hash, strlen(image_hash), vlob, vlob_length, conf->expire, 0);
     if(r==MEMCACHED_SUCCESS) {
-      AP_LOG_DEBUG(rec, "Stored to memcached: %s, len=%d", image_hash, vlob_length);
+      AP_LOG_DEBUG(rec, "Stored to memcached: %s(len=%d)", image_hash, vlob_length);
+    } else {
+      AP_LOG_DEBUG(rec, "Can't store from memcached: %s(len=%d) - %s(%d)", image_hash, vlob_length,memcached_strerror(conf->memc, r), r);
     }
   }
 
